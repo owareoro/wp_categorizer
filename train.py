@@ -1,16 +1,19 @@
-import functools
 import configparser
 from collections import defaultdict
 from itertools import chain
-import json
-import random
 from nltk import download
 from nltk import pos_tag
+from nltk.corpus import wordnet as wn
 from nltk.corpus import stopwords, wordnet
 from nltk.tokenize import word_tokenize
 from nltk.stem import WordNetLemmatizer, PorterStemmer
 import math
-import pickle
+from lib.loader import load_model, save_model
+from lib.parallel import parallel_map
+from lib.cache import use_buffer
+from lib.utils import cosine_similarity, get_accuracy, select, normalize
+from lib.iterate import iterate
+from lib.stats import RunningStats
 
 if __name__ == "__main__":
     # Ensure the required NLTK data is downloaded
@@ -44,6 +47,16 @@ def get_wordnet_pos(treebank_tag):
         return wordnet.NOUN  # Default to noun if no match
 
 
+def get_synonyms(word):
+    synsets = wn.synsets(word)
+    if not synsets:
+        return set()
+    res = set()
+    for synset in synsets:
+        res.add(synset.lemmas()[0].name())
+    return res
+
+
 # Step 1 - Preprocess Text
 def preprocess_text(text):
     tokens = word_tokenize(text.lower())
@@ -56,40 +69,6 @@ def preprocess_text(text):
         if word.isalnum() and word not in stop_words
     ]
     return words
-
-
-def buffer(temp_file, generator):
-    i = 0
-    err = None
-    while i < 2:
-        try:
-            with open(temp_file) as fo:
-                while True:
-                    line = fo.readline()
-                    if not line:
-                        break
-                    yield json.loads(line)
-            return
-        except Exception as e:
-            err = e
-            print("Caching results....")
-            with open(temp_file, "w") as f:
-                for row in generator:
-                    f.write(json.dumps(row) + "\n")
-            i += 1
-    raise err
-
-
-def use_buffer(temp_file):
-    def decorator(func):
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
-            generator = func(*args, **kwargs)
-            return buffer(temp_file, generator)
-
-        return wrapper
-
-    return decorator
 
 
 @use_buffer(".posts.temp")
@@ -179,11 +158,18 @@ def create_defaultdict():
     return defaultdict(float)
 
 
-def normalize(word_freq):
-    sum_of_squares = sum([freq**2 for freq in word_freq.values()])
-    norm = math.sqrt(sum_of_squares)
+running_stats = RunningStats()
+
+
+def add_synonyms(word_freq):
     for word in word_freq:
-        word_freq[word] /= norm
+        synonyms = get_synonyms(word)
+        if len(synonyms) == 0:
+            return
+        word_freq[word] *= 0.5
+        each = word_freq[word] / len(synonyms)
+        for synonym in synonyms:
+            word_freq[synonym] += each
 
 
 def train_model():
@@ -208,6 +194,8 @@ def train_model():
                 category_word_tf[category][word] = freq / count
         for category in categories:
             category_freq[category] += 1
+        if total_docs % 50 == 0:
+            print(f"Processed {total_docs} documents.")
 
     # Calculate the IDF for each word
     for word in category_doc_counts:
@@ -216,15 +204,16 @@ def train_model():
     # Calculate the TF-IDF for each word in each category
     for category, word_freq in category_word_tf.items():
         for word, freq in word_freq.items():
-            category_word_tf[category][word] *= word_idf[word]
+            word_freq[word] *= word_idf[word]
+        running_stats.add(word_idf[word])
+        add_synonyms(word_freq)
         normalize(word_freq)
 
     # Normalize the relative popularity of each category
     normalize(category_freq)
 
     results = (category_word_tf, word_idf, category_freq)
-    with open("training_results.pickle", "wb") as f:
-        pickle.dump(results, f)
+    save_model(results)
     print("Training completed.")
     return results
 
@@ -240,19 +229,6 @@ def calculate_tfidf(words, word_idf):
         tfidf_vector[word] = tf * word_idf[word]
     normalize(tfidf_vector)
     return tfidf_vector
-
-
-def cosine_similarity(vec1, vec2):
-    intersection = set(vec1.keys()) & set(vec2.keys())
-    numerator = sum([vec1[word] * vec2[word] for word in intersection])
-
-    sum1 = sum([vec1[word] ** 2 for word in vec1.keys()])
-    sum2 = sum([vec2[word] ** 2 for word in vec2.keys()])
-    denominator = math.sqrt(sum1) * math.sqrt(sum2)
-
-    if not denominator:
-        return 0.0
-    return float(numerator) / denominator
 
 
 # Categories that start with * always have one selected
@@ -299,21 +275,6 @@ def classify_post(
     )
 
 
-def get_accuracy(result_set: set, expected_set: set):
-    i = len(result_set & expected_set)
-    U = len(result_set) + len(expected_set) - i
-    return i / U if U > 0 else 0
-
-
-def load_model():
-    try:
-        with open("training_results.pickle", "rb") as f:
-            return pickle.load(f)
-    except Exception as e:
-        print(e)
-        return None
-
-
 def run_classify(content, actual_categories, model, config):
     results = classify_post(content, model, **config)
     return (
@@ -326,20 +287,8 @@ def run_classify(content, actual_categories, model, config):
     )
 
 
-# Select every n-th element from an iterable
-def select(n, iterable):
-    try:
-        for i in range(random.randint(0, n)):
-            next(iterable)
-        while True:
-            yield next(iterable)
-            for i in range(n):
-                next(iterable)
-    except StopIteration:
-        return
-
-
-def main():
+def main(conf={}):
+    CONFIG.update(conf)
     # Test the model on the same data
     total_posts = 0
     accuracy = 0
@@ -361,14 +310,6 @@ def main():
     return (accuracy / total_posts) if total_posts > 0 else 0
 
 
-def frange(x, y, jump):
-    while x <= y:
-        yield x
-        x += jump
-        if y > x and y - x < jump * 0.5 or x > y and x - y < jump * 0.5:
-            x = y
-
-
 CONFIG = {
     "cutoff": 0.06,
     "min_tags": 0,
@@ -378,98 +319,14 @@ CONFIG = {
     "show_samples": True,
 }  # Gotten from training
 
-shared_args = {}
-
-
-def init(task_id, func, args):
-    if task_id in shared_args:
-        raise Exception("Already initialized")
-    shared_args[task_id] = (func, args)
-
-
-def star_run(e):
-    func, args = shared_args[e[0]]
-    return func(*e[1], *args)
-
-
-def parallel_map(func, generator, *args):
-    import random
-    from multiprocessing import Pool
-
-    pickle.dumps(func)
-    pickle.dumps(args)
-
-    task_id = random.randint(0, 1000000)
-    with Pool(
-        initializer=init,
-        initargs=(
-            task_id,
-            func,
-            args,
-        ),
-    ) as p:
-        yield from p.imap(
-            star_run,
-            map(
-                lambda e: (task_id, (e if hasattr(e, "__iter__") else (e,))),
-                generator,
-            ),
-            chunksize=20,
-        )
-
-
-def iterate(config, eval_func):
-    for i in config:
-        if type(config[i]) == list:
-            CONFIG[i] = config[i][0]
-    while True:
-        scores = []
-        for i in config:
-            if type(config[i]) != list:
-                continue
-            tries = config[i]
-            if len(tries) == 1:
-                config[i] = CONFIG[i] = tries[0]
-                continue
-            val_type = type(tries[0])
-            best_val = None
-            best = 0
-            for j in tries:
-                CONFIG[i] = j
-                accuracy = eval_func()
-                scores.append(accuracy)
-                if accuracy >= best:
-                    best = accuracy
-                    best_val = j
-            if best_val is not None:
-                CONFIG[i] = best_val
-                x = tries.index(best_val)
-                m = [best_val]
-                if x > 0:
-                    m.insert(0, val_type((tries[x - 1] + best_val) / 2))
-                else:
-                    m.insert(0, val_type(tries[x] - (tries[x + 1] - best_val)))
-                if x < len(tries) - 1:
-                    m.append(val_type((tries[x + 1] + best_val) / 2))
-                else:
-                    m.append(val_type(tries[x] + (best_val - tries[x - 1])))
-                if m[0] == m[1]:
-                    m = m[1:]
-                if m[-2] == m[-1]:
-                    m = m[:-1]
-                config[i] = m
-            print(f"{i} = {best_val} -> {'..'.join(map(lambda e: '%.3f' % e, tries))}")
-            print(f"Accuracy: {best * 100:.2f}%")
-        print(
-            f"Accuracy: Avg: {sum(scores)/len(scores) * 100:.2f} Min: {min(scores) * 100:.2f}"
-        )
-        print(CONFIG)
-
 
 if __name__ == "__main__":
     print("Starting training...")
     CONFIG["select_size"] = 1
     model = load_model() or train_model()
+    print(
+        f"Stats: mean: {running_stats._mean} variance: {running_stats._variance}",
+    )
     # CONFIG["show_samples"] = False
     # CONFIG["select_size"] = 5
     # iterate(

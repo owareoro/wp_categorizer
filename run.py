@@ -6,7 +6,6 @@ from train import (
     load_model,
     parallel_map,
     CONFIG,
-    create_defaultdict,
     use_buffer,
 )
 
