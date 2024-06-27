@@ -5,15 +5,17 @@ from itertools import chain
 import json
 import random
 from nltk import download
-from nltk.corpus import stopwords
+from nltk import pos_tag
+from nltk.corpus import stopwords, wordnet
 from nltk.tokenize import word_tokenize
-from nltk.stem import WordNetLemmatizer
+from nltk.stem import WordNetLemmatizer, PorterStemmer
 import math
 import pickle
 
 if __name__ == "__main__":
     # Ensure the required NLTK data is downloaded
     download("stopwords")
+    download("averaged_perceptron_tagger")
     download("punkt")
     download("wordnet")  # Use nltk downloader to download resource "wordnet"
     download("omw-1.4")  # Use nltk downloader to download resource "omw-1.4"
@@ -29,11 +31,28 @@ run_from_database = config.getboolean("Settings", "RunFromDatabase")
 stop_words = set(stopwords.words("english"))
 
 
+def get_wordnet_pos(treebank_tag):
+    if treebank_tag.startswith("J"):
+        return wordnet.ADJ
+    elif treebank_tag.startswith("V"):
+        return wordnet.VERB
+    elif treebank_tag.startswith("N"):
+        return wordnet.NOUN
+    elif treebank_tag.startswith("R"):
+        return wordnet.ADV
+    else:
+        return wordnet.NOUN  # Default to noun if no match
+
+
+# Step 1 - Preprocess Text
 def preprocess_text(text):
     tokens = word_tokenize(text.lower())
+
+    tagged_words = pos_tag(tokens)
+
     words = [
-        lemmatizer.lemmatize(word)
-        for word in tokens
+        lemmatizer.lemmatize(word, pos=get_wordnet_pos(tag))
+        for word, tag in tagged_words
         if word.isalnum() and word not in stop_words
     ]
     return words
@@ -160,6 +179,13 @@ def create_defaultdict():
     return defaultdict(float)
 
 
+def normalize(word_freq):
+    sum_of_squares = sum([freq**2 for freq in word_freq.values()])
+    norm = math.sqrt(sum_of_squares)
+    for word in word_freq:
+        word_freq[word] /= norm
+
+
 def train_model():
     # Term frequency of each word in each category normalized to 1
     category_word_tf = defaultdict(create_defaultdict)
@@ -179,7 +205,7 @@ def train_model():
         for word, freq in word_freq.items():
             category_doc_counts[word] += 1
             for category in categories:
-                category_word_tf[category][word] = sigmoid(freq / count)
+                category_word_tf[category][word] = freq / count
         for category in categories:
             category_freq[category] += 1
 
@@ -191,18 +217,10 @@ def train_model():
     for category, word_freq in category_word_tf.items():
         for word, freq in word_freq.items():
             category_word_tf[category][word] *= word_idf[word]
-
-    # Normalize the TF-IDF for each category
-    for category, word_freq in category_word_tf.items():
-        sum_of_squares = sum([freq**2 for freq in word_freq.values()])
-        norm = math.sqrt(sum_of_squares)
-        for word in word_freq:
-            category_word_tf[category][word] /= norm
+        normalize(word_freq)
 
     # Normalize the relative popularity of each category
-    norm = math.sqrt(sum([freq**2 for freq in category_freq.values()]))
-    for category in category_freq:
-        category_freq[category] /= norm
+    normalize(category_freq)
 
     results = (category_word_tf, word_idf, category_freq)
     with open("training_results.pickle", "wb") as f:
@@ -219,8 +237,8 @@ def calculate_tfidf(words, word_idf):
     count = len(words)
     for word, freq in word_freq.items():
         tf = freq / count
-        idf = word_idf[word]
-        tfidf_vector[word] = tf * idf
+        tfidf_vector[word] = tf * word_idf[word]
+    normalize(tfidf_vector)
     return tfidf_vector
 
 
@@ -261,6 +279,8 @@ def classify_post(
         key=lambda e: e[1],
         reverse=True,
     )
+    if len(cats) > 1 and (cats[0][0] == "*News" or cats[1][0] == "*News"):
+        tags.append(cats[1])
     tags.sort(
         key=lambda e: e[1],
         reverse=True,
@@ -320,14 +340,13 @@ def select(n, iterable):
 
 
 def main():
-    # Train the model
-    model = load_model() or train_model()
-
     # Test the model on the same data
     total_posts = 0
     accuracy = 0
     i = 0
-    results_iter = parallel_map(run_classify, select(5, fetch_posts()), model, CONFIG)
+    results_iter = parallel_map(
+        run_classify, select(CONFIG["select_size"], fetch_posts()), model, CONFIG
+    )
     for results, score, actual_categories in results_iter:
         total_posts += 1
         accuracy += score
@@ -351,11 +370,12 @@ def frange(x, y, jump):
 
 
 CONFIG = {
-    "cutoff": 0.05859375000000004,
+    "cutoff": 0.06,
     "min_tags": 0,
-    "max_tags": -4,
-    "frequency_bias_cutoff": 0.29716796874999996,
-    "show_samples": False,
+    "max_tags": 5,
+    "select_size": 0,
+    "frequency_bias_cutoff": 0.25,
+    "show_samples": True,
 }  # Gotten from training
 
 shared_args = {}
@@ -403,6 +423,7 @@ def iterate(config, eval_func):
         if type(config[i]) == list:
             CONFIG[i] = config[i][0]
     while True:
+        scores = []
         for i in config:
             if type(config[i]) != list:
                 continue
@@ -416,11 +437,10 @@ def iterate(config, eval_func):
             for j in tries:
                 CONFIG[i] = j
                 accuracy = eval_func()
+                scores.append(accuracy)
                 if accuracy >= best:
                     best = accuracy
                     best_val = j
-                elif accuracy < worst:
-                    worst = accuracy
             if best_val is not None:
                 CONFIG[i] = best_val
                 x = tries.index(best_val)
@@ -440,18 +460,25 @@ def iterate(config, eval_func):
                 config[i] = m
             print(f"{i} = {best_val} -> {'..'.join(map(lambda e: '%.3f' % e, tries))}")
             print(f"Accuracy: {best * 100:.2f}%")
-            print(CONFIG)
+        print(
+            f"Accuracy: Avg: {sum(scores)/len(scores) * 100:.2f} Min: {min(scores) * 100:.2f}"
+        )
+        print(CONFIG)
 
 
 if __name__ == "__main__":
-    CONFIG["show_samples"] = False
     print("Starting training...")
-    iterate(
-        {
-            "cutoff": [0.1, 0.3],
-            "min_tags": [1, 2],
-            "max_tags": [2, 5],
-            "frequency_bias_cutoff": [0.1, 0.5],
-        },
-        main,
-    )
+    CONFIG["select_size"] = 1
+    model = load_model() or train_model()
+    # CONFIG["show_samples"] = False
+    # CONFIG["select_size"] = 5
+    # iterate(
+    #     {
+    #         "cutoff": [0, 0.1],
+    #         "min_tags": [1, 2],
+    #         "max_tags": [3, 8],
+    #         "frequency_bias_cutoff": [0.1, 0.3],
+    #     },
+    #     main,
+    # )
+    main()
