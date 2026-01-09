@@ -12,27 +12,33 @@ def get_cache_path(name):
     return os.path.join(cache_dir, name)
 
 
-def buffer(_temp_file, generator):
-    temp_file = get_cache_path(_temp_file)
-    i = 0
-    err = None
-    while i < 2:
+import json
+import os
+
+
+def buffer(temp_file_name, generator):
+    max_retries = 2
+    temp_file_path = get_cache_path(temp_file_name)
+
+    for attempt in range(max_retries):
         try:
-            with open(temp_file) as fo:
-                while True:
-                    line = fo.readline()
-                    if not line:
-                        break
-                    yield json.loads(line)
-            return
-        except Exception as e:
-            err = e
-            print("Caching results....")
-            with open(temp_file, "w") as f:
+            if os.path.exists(temp_file_path):
+                with open(temp_file_path, "r") as cache_file:
+                    for line in cache_file:
+                        yield json.loads(line)
+                return
+            else:
+                raise FileNotFoundError(f"Cache file {temp_file_path} not found.")
+
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            if attempt == max_retries - 1:
+                raise e  # If it's the last attempt, re-raise the exception
+
+            print(f"Attempt {attempt + 1} failed: {e}. Regenerating cache...")
+
+            with open(temp_file_path, "w") as cache_file:
                 for row in generator:
-                    f.write(json.dumps(row) + "\n")
-            i += 1
-    raise err
+                    cache_file.write(json.dumps(row) + "\n")
 
 
 def use_buffer(temp_file):

@@ -1,6 +1,7 @@
 import configparser
 from collections import defaultdict
 from itertools import chain
+from typing import cast
 from nltk import download
 from nltk import pos_tag
 from nltk.corpus import wordnet as wn
@@ -11,7 +12,13 @@ import math
 from lib.loader import load_model, save_model
 from lib.parallel import parallel_map
 from lib.cache import use_buffer
-from lib.utils import cosine_similarity, get_accuracy, select, normalize
+from lib.utils import (
+    cosine_similarity,
+    get_accuracy,
+    get_default_dict,
+    select,
+    normalize,
+)
 from lib.iterate import iterate
 from lib.stats import RunningStats
 
@@ -53,7 +60,7 @@ def get_synonyms(word):
         return set()
     res = set()
     for synset in synsets:
-        res.add(synset.lemmas()[0].name())
+        res.add(cast("Unknown", synset).lemmas()[0].name())
     return res
 
 
@@ -74,10 +81,10 @@ def preprocess_text(text):
 @use_buffer(".posts.temp")
 def fetch_posts():
     if run_from_database:
-
         import mysql.connector
 
         db = None
+        cursor = None
         try:
             db = mysql.connector.connect(
                 host=config.get("Settings", "Host"),
@@ -107,20 +114,21 @@ def fetch_posts():
                     break
                 print("Done")
                 for row in chunk:
-                    cat = "*" + row[2] if row[3] == "category" else row[2]
-                    if last_row and row[0] == last_row[0]:
+                    cat = "*" + row[2] if row[3] == "category" else row[2]  # type: ignore
+                    if last_row and row[0] == last_row[0]:  # type: ignore
                         last_row[2].append(cat)
                     else:
                         if last_row:
                             yield last_row[1:]
-                        last_row = [row[0], row[1], [cat]]
+                        last_row = [row[0], row[1], [cat]]  # type: ignore
             if last_row:
                 yield last_row[1:]
         except mysql.connector.Error as err:
             print(f"Error: {err}")
         finally:
             if db and db.is_connected():
-                cursor.close()
+                if cursor:
+                    cursor.close()
                 db.close()
     else:
         placeholder_posts = [
@@ -154,10 +162,6 @@ def sigmoid(e):
     return 1 / (1 + math.exp(-e))
 
 
-def create_defaultdict():
-    return defaultdict(float)
-
-
 running_stats = RunningStats()
 
 
@@ -174,7 +178,7 @@ def add_synonyms(word_freq):
 
 def train_model():
     # Term frequency of each word in each category normalized to 1
-    category_word_tf = defaultdict(create_defaultdict)
+    category_word_tf = get_default_dict()
     word_idf = defaultdict(float)
     category_doc_counts = defaultdict(float)
     category_freq = defaultdict(int)
@@ -203,9 +207,11 @@ def train_model():
 
     # Calculate the TF-IDF for each word in each category
     for category, word_freq in category_word_tf.items():
+        word = None
         for word, freq in word_freq.items():
             word_freq[word] *= word_idf[word]
-        running_stats.add(word_idf[word])
+        if word is not None:
+            running_stats.add(word_idf[word])
         add_synonyms(word_freq)
         normalize(word_freq)
 
@@ -227,6 +233,7 @@ def calculate_tfidf(words, word_idf):
     for word, freq in word_freq.items():
         tf = freq / count
         tfidf_vector[word] = tf * word_idf[word]
+
     normalize(tfidf_vector)
     return tfidf_vector
 
